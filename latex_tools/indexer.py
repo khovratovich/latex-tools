@@ -430,13 +430,17 @@ def build_index(root_tex: Path | str) -> dict:
             if pos < doc_start or pos > doc_end:
                 continue
 
-            # Skip environments nested inside any math context
-            if any(dm_s <= pos < dm_e for dm_s, dm_e in math_ranges):
+            # Skip environments nested inside any math context.
+            # Use dm_s < pos (strict) so equation-like envs don't exclude themselves
+            # (their own entry in math_ranges has dm_s == pos).
+            if any(dm_s < pos < dm_e for dm_s, dm_e in math_ranges):
                 continue
 
-            # Skip environments already covered by an AI block element
-            # (annotator already wrapped them — avoid duplicate indexing)
-            if any(ab_s <= pos < ab_e for ab_s, ab_e in ai_block_ranges):
+            # Skip environments already covered by their own AI block element
+            # (annotator wraps theorems/proofs/figures/sections — avoid duplicates).
+            # EQUATION_LIKE envs are exempt: annotator only adds \label, no AI block,
+            # so they fall inside section AI blocks but must still be indexed here.
+            if name not in EQUATION_LIKE and any(ab_s <= pos < ab_e for ab_s, ab_e in ai_block_ranges):
                 continue
 
             # Skip opaque rendering environments (index them but don't sub-parse)
