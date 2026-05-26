@@ -1,0 +1,357 @@
+"""
+annotator.py — Tool 1: enrich .tex files with stable addresses.
+
+What it does per file:
+  • Theorem-like envs without \\label  → insert \\label{TYPE:auto.SLUG.N}
+  • Equation-like envs without \\label → insert \\label{eq:auto.SLUG.N}
+    (starred variants are skipped — unnumbered by design)
+  • \\section / \\subsection / \\subsubsection without \\label
+    → append \\label{sec:auto.SLUG} on the same line
+  • Unknown/custom environments without markers
+    → wrap with %<ai:block id="TYPE:auto.SLUG.N"> / %</ai:block>
+  • Prose paragraphs between environments
+    → wrap with %<ai:block id="para:auto.SLUG.N" type="paragraph">
+
+All operations are idempotent: already-labeled/marked elements are skipped.
+A .tex.bak backup is written before any in-place modification.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+from pathlib import Path
+from typing import NamedTuple
+
+from latex_tools.parser import (
+    EQUATION_LIKE,
+    THEOREM_LIKE,
+    PROOF_LIKE,
+    FLOAT_LIKE,
+    OPAQUE_LIKE,
+    VERBATIM_LIKE,
+    TIKZ_LIKE,
+    _is_macro_file,
+    build_line_map,
+    byte_to_line,
+    find_document_body,
+    find_environments,
+    find_paragraphs_between,
+    find_sections,
+    resolve_includes,
+    section_at_pos,
+    section_command_span,
+    slugify,
+    strip_comments,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Environments for which we insert a \label{} (standard LaTeX environments)
+_LABELABLE = THEOREM_LIKE | PROOF_LIKE | FLOAT_LIKE
+
+# Environments we annotate with AI block comments (custom/non-standard)
+_AI_BLOCK_CUSTOM = set()  # populated dynamically: anything not in known sets
+
+# Environments we skip entirely (opaque content, verbatim, tikz)
+_SKIP_LABEL = VERBATIM_LIKE | TIKZ_LIKE | OPAQUE_LIKE | {"document", "instruction"}
+
+_LABEL_RE = re.compile(r"\\label\{")
+_AI_BLOCK_RE = re.compile(r"%\s*<ai:block\s")
+_AI_BLOCK_END_RE = re.compile(r"%\s*</ai:block>")
+
+# For detecting if a section already has a \label on the same or next line
+_SECTION_LABEL_NEARBY_RE = re.compile(r"\\label\{[^}]+\}")
+
+
+class _Insertion(NamedTuple):
+    """A pending text insertion at a byte offset."""
+    pos: int       # byte position in original source where text is inserted
+    text: str      # text to insert
+
+
+# ---------------------------------------------------------------------------
+# Label & ID generation
+# ---------------------------------------------------------------------------
+
+_ENV_PREFIX: dict[str, str] = {
+    "theorem": "thm",
+    "lemma": "lem",
+    "proposition": "prop",
+    "corollary": "cor",
+    "definition": "def",
+    "assumption": "asm",
+    "example": "ex",
+    "remark": "rem",
+    "claim": "clm",
+    "conjecture": "conj",
+    "notation": "not",
+    "observation": "obs",
+    "proof": "proof",
+    "figure": "fig",
+    "figure*": "fig",
+    "table": "tbl",
+    "table*": "tbl",
+}
+_DEFAULT_PREFIX = "env"
+
+
+def _env_prefix(name: str) -> str:
+    return _ENV_PREFIX.get(name, _DEFAULT_PREFIX)
+
+
+def _eq_is_starred(name: str) -> bool:
+    return name.endswith("*")
+
+
+def _make_label(prefix: str, section_slug: str, counter: int) -> str:
+    return f"{prefix}:auto.{section_slug}.{counter}"
+
+
+# ---------------------------------------------------------------------------
+# Per-file annotation
+# ---------------------------------------------------------------------------
+
+def annotate_file(
+    path: Path,
+    *,
+    section_slug_override: str | None = None,
+    global_counters: dict[str, int] | None = None,
+    dry_run: bool = False,
+) -> tuple[int, dict[str, int]]:
+    """
+    Annotate a single .tex file in-place (with .tex.bak backup).
+
+    Returns (insertions_made, updated_counters).
+    *global_counters* maps counter keys (e.g. "eq:auto.introduction") to the
+    last-used counter value; updated in-place and also returned.
+    """
+    if global_counters is None:
+        global_counters = {}
+
+    source = path.read_text(encoding="utf-8", errors="replace")
+    stripped = strip_comments(source)
+    line_map = build_line_map(source)
+
+    sections = find_sections(source, stripped=stripped)
+    envs = find_environments(source, stripped=stripped)
+
+    doc_start, doc_end = find_document_body(source)
+
+    # Collect pending insertions; apply in reverse order to preserve offsets
+    insertions: list[_Insertion] = []
+
+    # -----------------------------------------------------------------------
+    # 1. Annotate section headings without \label
+    # -----------------------------------------------------------------------
+    for sec in sections:
+        if sec["pos"] < doc_start:
+            continue
+        if sec["label"]:
+            continue  # already labeled
+        if sec["starred"]:
+            continue  # unnumbered sections don't need labels
+        cmd = sec["command"]
+        if cmd in ("paragraph", "subparagraph"):
+            continue  # \paragraph{} is not a float; skip label insertion
+
+        # Find end of \section{...} macro to append \label there
+        # The macro ends right after the closing } of the title
+        # We need to find it in the original source
+        # sec["pos"] points to the \ of the command
+        m = re.match(
+            r"\\(?:part|chapter|section|subsection|subsubsection)\*?\{[^}]*\}",
+            source[sec["pos"]:],
+        )
+        if not m:
+            continue
+        insert_pos = sec["pos"] + m.end()
+        slug = slugify(sec["title"]) or slugify(cmd)
+        label_id = f"sec:{slug}"
+        # Check if label already exists anywhere nearby (next 80 chars)
+        nearby = source[insert_pos : insert_pos + 80]
+        if _SECTION_LABEL_NEARBY_RE.search(nearby):
+            continue
+        insertions.append(_Insertion(insert_pos, f"\\label{{{label_id}}}"))
+
+    # -----------------------------------------------------------------------
+    # 2. Annotate environments
+    # -----------------------------------------------------------------------
+    for env in envs:
+        name = env["name"]
+        label = env["label"]
+        pos = env["pos"]
+        content = env["content"]
+
+        if pos < doc_start or pos > doc_end:
+            continue
+
+        sec_title, _ = section_at_pos(sections, pos)
+        sec_slug = slugify(sec_title) if sec_title else section_slug_override or "doc"
+
+        # ----------------------------------------------------------------
+        # Skip already-labeled or AI-blocked envs
+        # ----------------------------------------------------------------
+        if label or _AI_BLOCK_RE.search(source[max(0, pos - 120) : pos]):
+            continue
+
+        # ----------------------------------------------------------------
+        # Environments to insert \label into
+        # ----------------------------------------------------------------
+        if name in _LABELABLE:
+            prefix = _env_prefix(name)
+            counter_key = f"{prefix}:auto.{sec_slug}"
+            global_counters[counter_key] = global_counters.get(counter_key, 0) + 1
+            label_id = _make_label(prefix, sec_slug, global_counters[counter_key])
+
+            # Insert \label right after \begin{X} (or optional args)
+            # Find end of \begin{name}[...]{...} in original source
+            begin_end = _find_begin_end(source, pos, name)
+            insertions.append(_Insertion(begin_end, f"\\label{{{label_id}}}"))
+            continue
+
+        # ----------------------------------------------------------------
+        # Equation-like: insert \label unless starred
+        # ----------------------------------------------------------------
+        if name in EQUATION_LIKE:
+            if _eq_is_starred(name):
+                continue  # unnumbered by design
+            prefix = "eq"
+            counter_key = f"{prefix}:auto.{sec_slug}"
+            global_counters[counter_key] = global_counters.get(counter_key, 0) + 1
+            label_id = _make_label(prefix, sec_slug, global_counters[counter_key])
+            begin_end = _find_begin_end(source, pos, name)
+            # For align/gather, insert as a comment to not break alignment
+            if name in {"align", "align*", "gather", "gather*", "alignat", "alignat*"}:
+                # \label goes on its own line inside the env (before \end)
+                end_tag = f"\\end{{{name}}}"
+                end_pos = source.rfind(end_tag, pos, env["end"])
+                if end_pos > 0:
+                    insertions.append(_Insertion(end_pos, f"\\label{{{label_id}}}\n"))
+            else:
+                insertions.append(_Insertion(begin_end, f"\\label{{{label_id}}}"))
+            continue
+
+        # ----------------------------------------------------------------
+        # Skip opaque / verbatim / tikz
+        # ----------------------------------------------------------------
+        if name in (_SKIP_LABEL | VERBATIM_LIKE | TIKZ_LIKE | OPAQUE_LIKE):
+            continue
+
+        # ----------------------------------------------------------------
+        # Unknown/custom environments → AI block marker
+        # ----------------------------------------------------------------
+        prefix = name.rstrip("*")
+        counter_key = f"{prefix}:auto.{sec_slug}"
+        global_counters[counter_key] = global_counters.get(counter_key, 0) + 1
+        block_id = _make_label(prefix, sec_slug, global_counters[counter_key])
+
+        # Insert open marker before \begin{X} and close marker after \end{X}
+        open_marker = f"%<ai:block id=\"{block_id}\" type=\"{prefix}\">\n"
+        close_marker = f"%</ai:block>\n"
+        insertions.append(_Insertion(env["end"], close_marker))     # close first (higher pos)
+        insertions.append(_Insertion(pos, open_marker))             # open second (lower pos)
+
+    # -----------------------------------------------------------------------
+    # 3. Wrap prose paragraphs between environments with AI block markers
+    # -----------------------------------------------------------------------
+    excluded: list[tuple[int, int]] = []
+    for env in envs:
+        if env["pos"] >= doc_start:
+            excluded.append((env["pos"], env["end"]))
+    for sec in sections:
+        if sec["pos"] >= doc_start:
+            excluded.append(section_command_span(source, sec))
+    # Also exclude any AI blocks already present in source (idempotency)
+    for ai_m in _AI_BLOCK_RE.finditer(source):
+        excluded.append((ai_m.start(), ai_m.end()))
+
+    for para in find_paragraphs_between(source, excluded, doc_start, doc_end):
+        para_pos = para["pos"]
+        sec_title, _ = section_at_pos(sections, para_pos)
+        sec_slug = slugify(sec_title) if sec_title else section_slug_override or "doc"
+        counter_key = f"para:auto.{sec_slug}"
+        global_counters[counter_key] = global_counters.get(counter_key, 0) + 1
+        block_id = f"para:auto.{sec_slug}.{global_counters[counter_key]}"
+        open_marker = f'%<ai:block id="{block_id}" type="paragraph">\n'
+        close_marker = '\n%</ai:block>\n'
+        # Close at higher position first so sort puts it before open
+        insertions.append(_Insertion(para["end"], close_marker))
+        insertions.append(_Insertion(para["pos"], open_marker))
+
+    # -----------------------------------------------------------------------
+    # Apply insertions (must be in reverse position order)
+    # -----------------------------------------------------------------------
+    insertions.sort(key=lambda ins: ins.pos, reverse=True)
+
+    if not insertions:
+        return 0, global_counters
+
+    if dry_run:
+        return len(insertions), global_counters
+
+    # Write backup
+    backup = path.with_suffix(path.suffix + ".bak")
+    shutil.copy2(path, backup)
+
+    # Apply insertions
+    chars = list(source)
+    for ins in insertions:
+        chars.insert(ins.pos, ins.text)
+
+    path.write_text("".join(chars), encoding="utf-8")
+    return len(insertions), global_counters
+
+
+def _find_begin_end(source: str, begin_pos: int, env_name: str) -> int:
+    """
+    Find the byte offset right after \\begin{env_name}[opt]{arg} ...
+    i.e., past the mandatory \\begin{X} token and any immediately following
+    optional/required arguments.  Falls back to just after \\begin{X}.
+    """
+    # Minimal: skip past \begin{name}
+    token = f"\\begin{{{env_name}}}"
+    end = begin_pos + len(token)
+    # Skip optional arguments [...]
+    i = end
+    while i < len(source) and source[i] in (" ", "\t"):
+        i += 1
+    while i < len(source) and source[i] == "[":
+        depth = 0
+        while i < len(source):
+            if source[i] == "[":
+                depth += 1
+            elif source[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+    return i
+
+
+# ---------------------------------------------------------------------------
+# Project-level annotation
+# ---------------------------------------------------------------------------
+
+def annotate_project(root_tex: Path | str, *, dry_run: bool = False) -> dict:
+    """
+    Annotate all .tex files reachable from *root_tex*.
+
+    Returns a summary dict: {file: insertions_count, ...}
+    """
+    root_tex = Path(root_tex)
+    files = resolve_includes(root_tex)
+    counters: dict[str, int] = {}
+    summary: dict[str, int] = {}
+
+    for f in files:
+        if _is_macro_file(f):
+            summary[str(f)] = 0
+            continue
+        count, counters = annotate_file(f, global_counters=counters, dry_run=dry_run)
+        summary[str(f)] = count
+
+    return summary

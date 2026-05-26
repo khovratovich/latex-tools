@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.bak
+.latex-index.json
+training data/sampleVM/ch00-overview.tex
+training data/sampleVM/ch01-execution-model.tex
+training data/sampleVM/ch02-segmentation.tex
+training data/sampleVM/ch03-correct-execution.tex
+training data/sampleVM/ch04-proof-architecture.tex
+training data/sampleVM/ch05-security.tex
+training data/sampleVM/ch05-snark-instantiation.tex
+training data/sampleVM/macros.tex
+training data/sampleVM/w1-sample.aux
+training data/sampleVM/w1-sample.fdb_latexmk
+training data/sampleVM/w1-sample.fls
+training data/sampleVM/w1-sample.log
+training data/sampleVM/w1-sample.out
+training data/sampleVM/w1-sample.pdf
+training data/sampleVM/w1-sample.synctex.gz
+training data/sampleVM/w1-sample.tex

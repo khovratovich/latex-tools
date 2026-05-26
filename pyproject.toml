@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "latex-tools"
+version = "0.1.0"
+description = "Agent-friendly LaTeX tooling: annotator, indexer, and logical query API"
+requires-python = ">=3.10"
+dependencies = [
+    "pylatexenc>=2.10",
+    "fastmcp>=2.0",
+]
+
+[project.scripts]
+latex-tools = "latex_tools.cli:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["latex_tools"]
