@@ -93,6 +93,12 @@ class LatexDocument:
             raise KeyError(f"Element '{id_or_label}' not found in the index")
         return elem
 
+    def _fetch_source(self, elem: dict) -> str:
+        """Read the full LaTeX source block for *elem* directly from its source file."""
+        path = Path(elem["source_file"])
+        source = path.read_text(encoding="utf-8", errors="replace")
+        return source[elem["byte_start"]:elem["byte_end"]]
+
     # -----------------------------------------------------------------------
     # Read operations
     # -----------------------------------------------------------------------
@@ -127,9 +133,26 @@ class LatexDocument:
         """
         Return full element dict for *id_or_label*.
 
+        If the element's ``content_truncated`` flag is set, ``latex`` and
+        ``content`` are fetched from the source file on demand so the full
+        text is always returned.
+
         Raises KeyError if not found.
         """
-        return dict(self._require(id_or_label))
+        elem = dict(self._require(id_or_label))
+        if elem.get("content_truncated"):
+            full_latex = self._fetch_source(elem)
+            elem["latex"] = full_latex
+            elem["content"] = latex_to_text(full_latex)
+            elem["content_truncated"] = False
+        return elem
+
+    def get_latex(self, id_or_label: str) -> str:
+        """
+        Return the complete LaTeX source for *id_or_label*, always reading
+        from the source file via the stored byte range.  Never truncated.
+        """
+        return self._fetch_source(self._require(id_or_label))
 
     def get_context(
         self,
@@ -195,6 +218,58 @@ class LatexDocument:
                 summary["snippet"] = "..." + content[start:end] + "..."
                 results.append(summary)
         return results
+
+    def search_latex(
+        self,
+        query: str,
+        *,
+        type: str | None = None,
+        case_sensitive: bool = False,
+    ) -> list[str]:
+        """
+        Search all elements' **full** LaTeX source for *query* (substring or
+        regex).  Unlike ``search_elements()``, this always checks the complete
+        source text even for large blocks where the index only stores a
+        truncated preview — those are read from disk, grouped per source file
+        so each file is opened at most once.
+
+        Returns element IDs in document order.
+        """
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            needle = re.compile(re.escape(query), flags)
+        except re.error:
+            needle = re.compile(query, flags)
+
+        cached: list[dict] = []
+        by_file: dict[str, list[dict]] = {}
+
+        for elem in self._index.get("elements", []):
+            if type and elem.get("type") != type:
+                continue
+            if elem.get("content_truncated"):
+                by_file.setdefault(elem["source_file"], []).append(elem)
+            else:
+                cached.append(elem)
+
+        hits: list[str] = []
+
+        for elem in cached:
+            if needle.search(elem.get("latex", "")):
+                hits.append(elem["id"])
+
+        for file_path, file_elems in by_file.items():
+            try:
+                source = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for elem in file_elems:
+                if needle.search(source[elem["byte_start"]:elem["byte_end"]]):
+                    hits.append(elem["id"])
+
+        order = {e["id"]: i for i, e in enumerate(self._index.get("elements", []))}
+        hits.sort(key=lambda eid: order.get(eid, 0))
+        return hits
 
     def get_section(self, name: str) -> list[dict]:
         """
@@ -312,6 +387,65 @@ class LatexDocument:
     # -----------------------------------------------------------------------
     # Write operations
     # -----------------------------------------------------------------------
+
+    # -----------------------------------------------------------------------
+    # Tree navigation
+    # -----------------------------------------------------------------------
+
+    def get_children(self, id_or_label: str) -> list[dict]:
+        """Return direct child elements of *id_or_label* in document order."""
+        elem = self._require(id_or_label)
+        return [
+            _summary(self._by_id[cid])
+            for cid in elem.get("children", [])
+            if cid in self._by_id
+        ]
+
+    def get_parent(self, id_or_label: str) -> dict | None:
+        """Return the parent element, or None if *id_or_label* is top-level."""
+        elem = self._require(id_or_label)
+        pid = elem.get("parent_id")
+        if pid and pid in self._by_id:
+            return dict(self._by_id[pid])
+        return None
+
+    def get_subtree(
+        self,
+        id_or_label: str,
+        *,
+        max_depth: int = 5,
+        include_content: bool = False,
+    ) -> dict:
+        """
+        Return a nested dict representing *id_or_label* and all its
+        descendants up to *max_depth* levels deep.
+
+        Each node has the element's summary fields plus a ``children`` list
+        of nested nodes.  Set *include_content* to True to include the
+        ``content`` and ``latex`` fields (omitted by default for brevity).
+        """
+        elem = self._require(id_or_label)
+        return self._node(elem, max_depth, include_content)
+
+    def _node(self, elem: dict, depth: int, include_content: bool) -> dict:
+        node = _summary(elem)
+        if include_content:
+            if elem.get("content_truncated"):
+                full_latex = self._fetch_source(elem)
+                node["content"] = latex_to_text(full_latex)
+                node["latex"] = full_latex
+            else:
+                node["content"] = elem.get("content", "")
+                node["latex"] = elem.get("latex", "")
+        if depth > 0:
+            node["children"] = [
+                self._node(self._by_id[cid], depth - 1, include_content)
+                for cid in elem.get("children", [])
+                if cid in self._by_id
+            ]
+        else:
+            node["children"] = [f"... ({len(elem.get('children', []))} children)"]
+        return node
 
     def update_element(self, id_or_label: str, replacement_latex: str) -> dict:
         """

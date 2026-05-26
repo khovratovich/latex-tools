@@ -493,6 +493,55 @@ def find_document_body(source: str) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# AI block marker parser (stack-based — handles nested blocks correctly)
+# ---------------------------------------------------------------------------
+
+_AI_OPEN_TAG_RE = re.compile(
+    r'%\s*<ai:block\s+id="([^"]+)"\s+type="([^"]+)">'
+)
+_AI_CLOSE_TAG_RE = re.compile(r'%\s*</ai:block>')
+
+
+def find_ai_blocks(source: str) -> list[dict]:
+    """
+    Parse ``%<ai:block id="..." type="...">`` / ``%</ai:block>`` markers
+    using a stack so that nested blocks are handled correctly.
+
+    Returns ALL blocks at every nesting depth.
+    Each result dict: {id, type, content, pos, end, depth}
+    where *pos* is the byte start of the opening tag and *end* is the byte
+    end (exclusive) of the closing tag.
+    """
+    events: list[tuple[str, int, int, str | None, str | None]] = []
+    for m in _AI_OPEN_TAG_RE.finditer(source):
+        events.append(("open", m.start(), m.end(), m.group(1), m.group(2)))
+    for m in _AI_CLOSE_TAG_RE.finditer(source):
+        events.append(("close", m.start(), m.end(), None, None))
+    events.sort(key=lambda ev: ev[1])
+
+    results: list[dict] = []
+    stack: list[tuple[int, int, str, str]] = []  # (open_pos, open_end, id, type)
+
+    for ev_type, pos, tag_end, bid, btype in events:
+        if ev_type == "open":
+            stack.append((pos, tag_end, bid, btype))  # type: ignore[arg-type]
+        elif ev_type == "close" and stack:
+            open_pos, open_tag_end, block_id, block_type = stack.pop()
+            results.append({
+                "id": block_id,
+                "type": block_type,
+                "content": source[open_tag_end:pos].strip(),
+                "pos": open_pos,
+                "end": tag_end,
+                "depth": len(stack),
+            })
+
+    # Sort by position so callers get a stable order
+    results.sort(key=lambda r: r["pos"])
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Utility: strip LaTeX commands for plain-text content extraction
 # ---------------------------------------------------------------------------
 

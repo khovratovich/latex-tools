@@ -40,6 +40,8 @@ from latex_tools.parser import (
     _is_macro_file,
     build_line_map,
     byte_to_line,
+    find_ai_blocks,
+    find_display_math,
     find_document_body,
     find_environments,
     find_paragraphs_between,
@@ -141,6 +143,120 @@ def _extract_cites(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Tree builder — assigns parent_id / children to every element
+# ---------------------------------------------------------------------------
+
+_SECTION_TYPES = {"part", "chapter", "section", "subsection", "subsubsection"}
+_SECTION_LEVEL = {
+    "part": 0, "chapter": 1, "section": 2, "subsection": 3, "subsubsection": 4,
+}
+
+
+def _build_element_tree(elements: list[dict]) -> None:
+    """
+    Compute ``parent_id`` and ``children`` for every element in-place.
+
+    When the annotator has run, section/subsection/subsubsection elements have
+    proper byte ranges (from their AI block markers) and nest naturally via
+    byte-range containment, just like every other block.
+
+    Fallback: sections that still have ``byte_end == byte_start`` (annotator not
+    run) get a computed effective end equal to the start of the next sibling-or-
+    higher section in the same file, so the tree is still meaningful.
+    """
+    if not elements:
+        return
+
+    for e in elements:
+        e["parent_id"] = None
+        e["children"] = []
+
+    by_id: dict[str, dict] = {e["id"]: e for e in elements}
+
+    from collections import defaultdict
+
+    # ------------------------------------------------------------------
+    # Fallback effective ends for point-like section elements
+    # (byte_end == byte_start means no AI block wrapping available).
+    # ------------------------------------------------------------------
+    sec_fallback_end: dict[str, int] = {}
+    secs_by_file: dict[str, list[dict]] = defaultdict(list)
+    for e in elements:
+        if e["type"] in _SECTION_TYPES and e.get("byte_end", 0) == e.get("byte_start", 0):
+            secs_by_file[e.get("source_file", "")].append(e)
+
+    for file_path, file_secs in secs_by_file.items():
+        file_secs_sorted = sorted(file_secs, key=lambda s: s["byte_start"])
+        file_max = max(
+            (e.get("byte_end", 0) for e in elements if e.get("source_file") == file_path),
+            default=0,
+        ) + 1
+        for i, sec in enumerate(file_secs_sorted):
+            lvl = _SECTION_LEVEL.get(sec["type"], 9)
+            end = file_max
+            for j in range(i + 1, len(file_secs_sorted)):
+                nxt = file_secs_sorted[j]
+                if _SECTION_LEVEL.get(nxt["type"], 9) <= lvl:
+                    end = nxt["byte_start"]
+                    break
+            sec_fallback_end[sec["id"]] = end
+
+    def _byte_end(e: dict) -> int:
+        be = e.get("byte_end", e.get("byte_start", 0))
+        bs = e.get("byte_start", 0)
+        if be == bs and e["id"] in sec_fallback_end:
+            return sec_fallback_end[e["id"]]
+        return be
+
+    # ------------------------------------------------------------------
+    # Single byte-range containment sweep.
+    # Sort: group by file first; within a file, outer containers
+    # (larger byte ranges) sort before their children.
+    # ------------------------------------------------------------------
+    sorted_elems = sorted(
+        elements,
+        key=lambda e: (
+            e.get("source_file", ""),
+            e.get("byte_start", 0),
+            -(_byte_end(e) - e.get("byte_start", 0)),
+        ),
+    )
+
+    stack: list[tuple[int, str, str]] = []  # (byte_end, source_file, element_id)
+
+    for elem in sorted_elems:
+        bs = elem.get("byte_start", 0)
+        be = _byte_end(elem)
+        file_ = elem.get("source_file", "")
+
+        # Pop containers that ended or belong to a different file
+        while stack and (stack[-1][0] <= bs or stack[-1][1] != file_):
+            stack.pop()
+
+        if stack:
+            parent_id = stack[-1][2]
+            if parent_id != elem["id"]:
+                elem["parent_id"] = parent_id
+                by_id[parent_id]["children"].append(elem["id"])
+
+        if be > bs:
+            stack.append((be, file_, elem["id"]))
+
+    # ------------------------------------------------------------------
+    # Post-processing: deduplicate children lists and sort by byte_start.
+    # ------------------------------------------------------------------
+    for e in elements:
+        seen: set[str] = set()
+        unique: list[str] = []
+        for cid in e["children"]:
+            if cid not in seen:
+                seen.add(cid)
+                unique.append(cid)
+        unique.sort(key=lambda cid: by_id[cid].get("byte_start", 0) if cid in by_id else 0)
+        e["children"] = unique
+
+
+# ---------------------------------------------------------------------------
 # Core indexer
 # ---------------------------------------------------------------------------
 
@@ -184,6 +300,11 @@ def build_index(root_tex: Path | str) -> dict:
         doc_start, doc_end = find_document_body(source)
         sections = find_sections(source, stripped=stripped)
         envs = find_environments(source, stripped=stripped)
+        display_math = find_display_math(source, stripped=stripped)
+        # Combine $$...$$ / \[..\] with \begin{align}..\end{align} etc.
+        math_ranges = display_math + [
+            (e["pos"], e["end"]) for e in envs if e["name"] in EQUATION_LIKE
+        ]
 
         # Add sections to TOC
         for sec in sections:
@@ -210,6 +331,7 @@ def build_index(root_tex: Path | str) -> dict:
                 "numbered": not sec["starred"],
                 "content": sec["title"],
                 "latex": sec["title"],
+                "content_truncated": False,
                 "source_file": str(file_path),
                 "line_start": sec["line"],
                 "line_end": sec["line"],
@@ -221,34 +343,79 @@ def build_index(root_tex: Path | str) -> dict:
                 label_to_id[sec["label"]] = sec_id
 
         # -----------------------------------------------------------------------
-        # Index AI block markers (from annotator output)
+        # Index AI block markers (from annotator output) — stack-based, nesting-aware
         # -----------------------------------------------------------------------
-        for ai_m in _AI_BLOCK_RE.finditer(source):
-            block_id = ai_m.group(1)
-            block_type = ai_m.group(2)
-            block_content = ai_m.group(3).strip()
-            pos = ai_m.start()
+        # Section types: when the annotator wraps a section with an AI block we update
+        # the existing section element's byte range instead of creating a duplicate.
+        _SEC_BLOCK_TYPES = {"section", "subsection", "subsubsection"}
+        # Build a lookup for section elements indexed for this file
+        sec_elem_by_id: dict[str, dict] = {
+            e["id"]: e
+            for e in elements
+            if e.get("source_file") == str(file_path) and e["type"] in _SEC_BLOCK_TYPES
+        }
+
+        ai_block_ranges: list[tuple[int, int]] = []  # track for env dedup below
+        for blk in find_ai_blocks(source):
+            pos = blk["pos"]
             if pos < doc_start or pos > doc_end:
                 continue
+            block_content = blk["content"]
             sec_title, subsec_title = section_at_pos(sections, pos)
+
+            # If this AI block wraps a section heading, update the existing section
+            # element's byte range rather than creating a second element.
+            if blk["type"] in _SEC_BLOCK_TYPES:
+                existing = sec_elem_by_id.get(blk["id"])
+                if existing is None:
+                    # Position-based fallback: the annotator may use a different ID
+                    # format (e.g. sec:star.slug.n for starred sections). Find the
+                    # section element whose \section command falls inside this block.
+                    for _se in sec_elem_by_id.values():
+                        if pos <= _se["byte_start"] <= blk["end"]:
+                            existing = _se
+                            break
+                if existing is not None:
+                    old_id = existing["id"]
+                    existing["id"] = blk["id"]  # adopt AI block ID
+                    existing["byte_start"] = pos
+                    existing["byte_end"] = blk["end"]
+                    existing["line_start"] = byte_to_line(line_map, pos)
+                    existing["line_end"] = byte_to_line(line_map, blk["end"] - 1)
+                    existing["content"] = latex_to_text(block_content)[:2000]
+                    existing["latex"] = block_content[:4000]
+                    existing["content_truncated"] = len(block_content) > 4000
+                    cross_refs[blk["id"]] = _extract_refs(block_content)
+                    ai_block_ranges.append((pos, blk["end"]))
+                    if old_id != blk["id"]:
+                        sec_elem_by_id[blk["id"]] = existing
+                        sec_elem_by_id.pop(old_id, None)
+                        cross_refs.pop(old_id, None)
+                        if label_to_id.get(existing.get("label")) == old_id:
+                            label_to_id[existing["label"]] = blk["id"]
+                    continue
+                # Ultimate fallback: annotator block has no matching section element
+
             elem = {
-                "id": block_id,
-                "type": block_type,
+                "id": blk["id"],
+                "type": blk["type"],
                 "label": None,
                 "title": None,
                 "section": sec_title,
                 "subsection": subsec_title,
                 "numbered": False,
-                "content": latex_to_text(block_content),
-                "latex": block_content,
+                "content": latex_to_text(block_content)[:2000],
+                "latex": block_content[:4000],
+                "content_truncated": len(block_content) > 4000,
                 "source_file": str(file_path),
                 "line_start": byte_to_line(line_map, pos),
-                "line_end": byte_to_line(line_map, ai_m.end() - 1),
+                "line_end": byte_to_line(line_map, blk["end"] - 1),
                 "byte_start": pos,
-                "byte_end": ai_m.end(),
+                "byte_end": blk["end"],
             }
             elements.append(elem)
-            cross_refs[block_id] = _extract_refs(block_content)
+            cross_refs[blk["id"]] = _extract_refs(block_content)
+            ai_block_ranges.append((pos, blk["end"]))
 
         # -----------------------------------------------------------------------
         # Index environments
@@ -261,6 +428,15 @@ def build_index(root_tex: Path | str) -> dict:
             content = env["content"]
 
             if pos < doc_start or pos > doc_end:
+                continue
+
+            # Skip environments nested inside any math context
+            if any(dm_s <= pos < dm_e for dm_s, dm_e in math_ranges):
+                continue
+
+            # Skip environments already covered by an AI block element
+            # (annotator already wrapped them — avoid duplicate indexing)
+            if any(ab_s <= pos < ab_e for ab_s, ab_e in ai_block_ranges):
                 continue
 
             # Skip opaque rendering environments (index them but don't sub-parse)
@@ -303,6 +479,7 @@ def build_index(root_tex: Path | str) -> dict:
                 "numbered": numbered,
                 "content": plain_content[:2000],  # cap for large environments
                 "latex": body_latex[:4000],
+                "content_truncated": len(body_latex) > 4000,
                 "source_file": str(file_path),
                 "line_start": env["line_start"],
                 "line_end": env["line_end"],
@@ -333,6 +510,43 @@ def build_index(root_tex: Path | str) -> dict:
         if _is_macro_file(file_path):
             continue
 
+        # -----------------------------------------------------------------------
+        # Index display math ($$...$$ and \[...\]) as equation elements
+        # -----------------------------------------------------------------------
+        for dm_start, dm_end in display_math:
+            if dm_start < doc_start or dm_start > doc_end:
+                continue
+            # Skip if already covered by an indexed element
+            if any(
+                e["byte_start"] <= dm_start < e["byte_end"]
+                for e in elements
+                if e.get("source_file") == str(file_path)
+            ):
+                continue
+            sec_title, subsec_title = section_at_pos(sections, dm_start)
+            sec_slug = slugify(sec_title) if sec_title else "doc"
+            dm_id = _next_id("eq", sec_slug)
+            dm_content = source[dm_start:dm_end]
+            dm_elem: dict = {
+                "id": dm_id,
+                "type": "equation",
+                "label": None,
+                "title": None,
+                "section": sec_title,
+                "subsection": subsec_title,
+                "numbered": False,
+                "content": latex_to_text(dm_content)[:2000],
+                "latex": dm_content[:4000],
+                "content_truncated": len(dm_content) > 4000,
+                "source_file": str(file_path),
+                "line_start": byte_to_line(line_map, dm_start),
+                "line_end": byte_to_line(line_map, dm_end - 1),
+                "byte_start": dm_start,
+                "byte_end": dm_end,
+            }
+            elements.append(dm_elem)
+            cross_refs[dm_id] = _extract_refs(dm_content)
+
         excluded_ranges: list[tuple[int, int]] = [
             (e["byte_start"], e["byte_end"])
             for e in elements
@@ -344,6 +558,8 @@ def build_index(root_tex: Path | str) -> dict:
             for s in sections
             if s["pos"] >= doc_start
         ]
+        # Exclude display math blocks so paragraphs don't straddle them
+        excluded_ranges.extend(display_math)
         # Also exclude \input / \include / \subfile command lines
         for inc_m in re.finditer(
             r"\\(?:input|include|subfile|subfileinclude)\s*\{[^}]*\}",
@@ -374,6 +590,7 @@ def build_index(root_tex: Path | str) -> dict:
                 "numbered": False,
                 "content": latex_to_text(para["content"])[:2000],
                 "latex": para["content"][:4000],
+                "content_truncated": len(para["content"]) > 4000,
                 "source_file": str(file_path),
                 "line_start": para["line_start"],
                 "line_end": para["line_end"],
@@ -412,6 +629,11 @@ def build_index(root_tex: Path | str) -> dict:
     for elem_id, refs in cross_refs.items():
         for ref in refs:
             ref_to_elements.setdefault(ref, []).append(elem_id)
+
+    # -----------------------------------------------------------------------
+    # Build parent_id / children tree
+    # -----------------------------------------------------------------------
+    _build_element_tree(elements)
 
     return {
         "document": root_tex.name,

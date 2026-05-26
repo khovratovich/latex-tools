@@ -34,6 +34,8 @@ from latex_tools.parser import (
     _is_macro_file,
     build_line_map,
     byte_to_line,
+    find_ai_blocks,
+    find_display_math,
     find_document_body,
     find_environments,
     find_paragraphs_between,
@@ -68,8 +70,10 @@ _SECTION_LABEL_NEARBY_RE = re.compile(r"\\label\{[^}]+\}")
 
 class _Insertion(NamedTuple):
     """A pending text insertion at a byte offset."""
-    pos: int       # byte position in original source where text is inserted
-    text: str      # text to insert
+    pos: int           # byte position in original source where text is inserted
+    text: str          # text to insert
+    priority: int = 1  # sort tiebreaker at same pos: lower = processed first = appears last
+                       # opens: 0, default: 1, section-close: 10+level (inner > outer)
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +143,68 @@ def annotate_file(
     envs = find_environments(source, stripped=stripped)
 
     doc_start, doc_end = find_document_body(source)
+    display_math = find_display_math(source, stripped=stripped)
+    # Combine $$...$$ / \[..\] with \begin{align}..\end{align} etc.
+    # so that sub-environments inside any math context are all skipped.
+    math_ranges = display_math + [
+        (e["pos"], e["end"]) for e in envs if e["name"] in EQUATION_LIKE
+    ]
 
     # Collect pending insertions; apply in reverse order to preserve offsets
     insertions: list[_Insertion] = []
+
+    # -----------------------------------------------------------------------
+    # 0. Wrap section / subsection / subsubsection with AI block markers
+    # -----------------------------------------------------------------------
+    _SEC_BLOCK_CMDS = {"section", "subsection", "subsubsection"}
+    _SEC_CMD_LEVEL = {"section": 2, "subsection": 3, "subsubsection": 4}
+
+    # Process all section commands within the document body.
+    secs_to_wrap = [
+        s for s in sections
+        if s["command"] in _SEC_BLOCK_CMDS
+        and s["pos"] >= doc_start
+    ]
+    secs_to_wrap.sort(key=lambda s: s["pos"])
+
+    # Per-slug counter for starred-section IDs (reset per file, matches indexer
+    # position-based lookup so cross-file counter sync is not required).
+    _star_counters: dict[str, int] = {}
+
+    def _sec_ai_id(s: dict) -> str:
+        """Derive the AI block ID for a section (matches the indexer's ID)."""
+        if s["label"]:
+            return s["label"]
+        slug = slugify(s["title"]) or slugify(s["command"])
+        if s["starred"]:
+            _star_counters[slug] = _star_counters.get(slug, 0) + 1
+            return f"sec:star.{slug}.{_star_counters[slug]}"
+        return f"sec:{slug}"
+
+    for i, sec in enumerate(secs_to_wrap):
+        # Idempotency: skip if already wrapped
+        pre = source[max(0, sec["pos"] - 80) : sec["pos"]]
+        if _AI_BLOCK_RE.search(pre):
+            continue
+
+        sec_id = _sec_ai_id(sec)
+        sec_type = sec["command"]
+        lvl = _SEC_CMD_LEVEL[sec_type]
+
+        # Close position: start of next section at same or higher level, or doc_end
+        close = doc_end
+        for j in range(i + 1, len(secs_to_wrap)):
+            nxt = secs_to_wrap[j]
+            if _SEC_CMD_LEVEL[nxt["command"]] <= lvl:
+                close = nxt["pos"]
+                break
+
+        open_marker = f'%<ai:block id="{sec_id}" type="{sec_type}">\n'
+        close_marker = '%</ai:block>\n'
+
+        # priority: opens=0 (appear last), closes=10+level (innermost=highest=appears first)
+        insertions.append(_Insertion(sec["pos"], open_marker, 0))
+        insertions.append(_Insertion(close, close_marker, 10 + lvl))
 
     # -----------------------------------------------------------------------
     # 1. Annotate section headings without \label
@@ -186,6 +249,10 @@ def annotate_file(
         content = env["content"]
 
         if pos < doc_start or pos > doc_end:
+            continue
+
+        # Skip environments nested inside any math context ($$, \[, align, multline, …)
+        if any(dm_s <= pos < dm_e for dm_s, dm_e in math_ranges):
             continue
 
         sec_title, _ = section_at_pos(sections, pos)
@@ -255,7 +322,27 @@ def annotate_file(
         insertions.append(_Insertion(pos, open_marker))             # open second (lower pos)
 
     # -----------------------------------------------------------------------
-    # 3. Wrap prose paragraphs between environments with AI block markers
+    # 2b. Wrap display math ($$...$$  and  \[...\]) with AI block markers
+    # -----------------------------------------------------------------------
+    eq_ranges = [(e["pos"], e["end"]) for e in envs if e["name"] in EQUATION_LIKE]
+    for dm_start, dm_end in display_math:
+        if dm_start < doc_start or dm_start > doc_end:
+            continue
+        # Idempotency: skip if already wrapped
+        if _AI_BLOCK_RE.search(source[max(0, dm_start - 120) : dm_start]):
+            continue
+        # Skip if $$...$$ somehow appears inside a \begin{align} (shouldn't happen, but safe)
+        if any(eq_s <= dm_start < eq_e for eq_s, eq_e in eq_ranges):
+            continue
+        sec_title, _ = section_at_pos(sections, dm_start)
+        sec_slug = slugify(sec_title) if sec_title else section_slug_override or "doc"
+        counter_key = f"eq:auto.{sec_slug}"
+        global_counters[counter_key] = global_counters.get(counter_key, 0) + 1
+        block_id = f"eq:auto.{sec_slug}.{global_counters[counter_key]}"
+        open_marker = f'%<ai:block id="{block_id}" type="display-math">\n'
+        close_marker = '\n%</ai:block>\n'
+        insertions.append(_Insertion(dm_end, close_marker))
+        insertions.append(_Insertion(dm_start, open_marker))
     # -----------------------------------------------------------------------
     excluded: list[tuple[int, int]] = []
     for env in envs:
@@ -264,9 +351,14 @@ def annotate_file(
     for sec in sections:
         if sec["pos"] >= doc_start:
             excluded.append(section_command_span(source, sec))
-    # Also exclude any AI blocks already present in source (idempotency)
-    for ai_m in _AI_BLOCK_RE.finditer(source):
-        excluded.append((ai_m.start(), ai_m.end()))
+    # Exclude display math regions and AI blocks that are content (not containers).
+    # Section AI blocks are large containers — do NOT exclude them or paragraph
+    # finding inside sections would be suppressed.
+    excluded.extend(display_math)
+    _SEC_CONTAINER_TYPES = {"section", "subsection", "subsubsection"}
+    for blk in find_ai_blocks(source):
+        if blk.get("type") not in _SEC_CONTAINER_TYPES:
+            excluded.append((blk["pos"], blk["end"]))
 
     for para in find_paragraphs_between(source, excluded, doc_start, doc_end):
         para_pos = para["pos"]
@@ -282,9 +374,10 @@ def annotate_file(
         insertions.append(_Insertion(para["pos"], open_marker))
 
     # -----------------------------------------------------------------------
-    # Apply insertions (must be in reverse position order)
+    # Apply insertions (reverse position order; at equal pos, lower priority first
+    # so that higher-priority items are applied last and appear first in output)
     # -----------------------------------------------------------------------
-    insertions.sort(key=lambda ins: ins.pos, reverse=True)
+    insertions.sort(key=lambda ins: (-ins.pos, ins.priority))
 
     if not insertions:
         return 0, global_counters
